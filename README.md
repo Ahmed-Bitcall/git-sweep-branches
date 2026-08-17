@@ -1,3 +1,5 @@
+[![Git-Repo-Header-Image-from-Gemini.jpg](https://i.postimg.cc/Y9LdVZp7/Git-Repo-Header-Image-from-Gemini.jpg)](https://postimg.cc/mzR31dzp)
+
 # git-sweep-branches
 
 Your merged branches pile up on the remote for months. This finds the ones that are
