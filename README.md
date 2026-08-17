@@ -6,19 +6,29 @@ machine — and deletes them only if you say so, one by one, per repo, or all at
 
 ```
 $ git-sweep-branches --list
-Scanning 14 repositories for branches merged and idle > 30 days...
 
-  [1/14] api — 19
-  [2/14] web — 59
+› git-sweep-branches v1.2.0
+  14 repos • merged • idle > 30 days
 
-api (/home/you/work/api)
-  feat/payment-override                     2026-05-11    97d  PR #255 2026-05-11
-  fix/blocked-connection-status             2026-03-30   139d  merged into release-candidate
-  feat/unified-tariff-plans                 2026-04-10   129d  squash-merged
+   1/14 api                       ✓ 19 of 87 remote branches
+   2/14 web                       ✓ 59 of 494 remote branches
+   3/14 docs                      •  0 of 26
+──────────────────────────────────────────────────────────────────
+
+api /home/you/work/api • 19
+  feat/payment-override            2026-05-11    97d  PR #255 2026-05-11
+  fix/blocked-connection-status    2026-03-30   139d  in release-candidate
+  feat/unified-tariff-plans        2026-04-10   129d  squashed into release-candidate
   ...
-
-103 branch(es) across 6 repo(s).
+──────────────────────────────────────────────────────────────────
+103 branches across 6 repos • 1046 examined • 71s
+passed over: 700 not yours, 94 unmerged, 21 too recent, 41 protected, 96 open PR
 ```
+
+Age is colour-coded (green under 90 days, amber under 180, red beyond), and the
+merge evidence is tinted by kind — ancestry, PR, or squash. Colour turns itself off
+for pipes, `TERM=dumb`, and [`NO_COLOR`](https://no-color.org); force it either way
+with `--color always|never`.
 
 ## Install
 
@@ -50,9 +60,22 @@ When there is something to sweep, it asks:
 ```
 Delete these remote branches?
   [a] all at once   [r] repo by repo   [o] one by one   [q] quit
+›
 ```
 
-Every step is declinable: `N` skips, `q` stops the whole run.
+Every step is declinable: `N` skips, `q` stops the whole run. Answers are
+case-insensitive and whitespace-tolerant — `y`, `Y`, `yes`, `YES` and ` Yes ` are the
+same answer, as are `a`/`A`/`all` and `q`/`Q`/`quit`. Anything unrecognised is treated
+as "no", so a stray keystroke never deletes.
+
+Run `--verbose` to see why each branch was passed over, or `--quiet` for results only:
+
+```
+$ git-sweep-branches --list --verbose
+      • api/feat/old-thing — tip by someone@else.com
+      • api/sprint-14 — protected name
+      • api/feat/wip — has an open PR
+```
 
 ## What counts as "merged"
 
@@ -113,6 +136,9 @@ log is the reliable path.
 | `--no-fetch` | Skip `git fetch` (faster, works off stale refs) |
 | `--include-protected` | Do not skip protected-looking names |
 | `--protect REGEX` | Replace the protected pattern |
+| `-v`, `--verbose` | Say why each branch was passed over |
+| `-q`, `--quiet` | Results only, no progress |
+| `--color WHEN` | `always`, `never` or `auto` (default; `NO_COLOR` honoured) |
 
 ## Which repos get scanned
 

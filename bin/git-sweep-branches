@@ -17,7 +17,7 @@
 
 set -uo pipefail
 
-VERSION="1.1.0"
+VERSION="1.2.0"
 AGE_DAYS=30
 LIST_ONLY=0
 JSON=0
@@ -26,6 +26,9 @@ PRUNE_LOCAL=0
 DO_FETCH=1
 ALL_AUTHORS=0
 INCLUDE_PROTECTED=0
+VERBOSE=0
+QUIET=0
+COLOR=auto
 AUTHORS=()
 REPOS=()
 EXTRA_INTO=()
@@ -37,16 +40,76 @@ PROTECT_RE='^(main|master|develop|dev|staging|production|release-candidate|previ
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/git-sweep-branches"
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/git-sweep-branches"
 
-if [ -t 1 ]; then
-  BOLD=$'\033[1m'; DIM=$'\033[2m'; RED=$'\033[31m'; GREEN=$'\033[32m'
-  YELLOW=$'\033[33m'; CYAN=$'\033[36m'; RESET=$'\033[0m'
-else
-  BOLD=""; DIM=""; RED=""; GREEN=""; YELLOW=""; CYAN=""; RESET=""
-fi
+# ------------------------------------------------------------------ styling --
+setup_colors() {
+  # NO_COLOR (https://no-color.org) and a non-tty both mean plain text.
+  if [ "$COLOR" = never ] ||
+     { [ "$COLOR" = auto ] && { [ -n "${NO_COLOR:-}" ] || [ ! -t 1 ] || [ "${TERM:-}" = dumb ]; }; }; then
+    BOLD=""; DIM=""; RED=""; GREEN=""; YELLOW=""; BLUE=""; CYAN=""; MAGENTA=""; RESET=""
+    TICK="+"; CROSS="x"; ARROW=">"; BULLET="-"; RULE="-"
+  else
+    BOLD=$'\033[1m'; DIM=$'\033[2m'; RED=$'\033[31m'; GREEN=$'\033[32m'
+    YELLOW=$'\033[33m'; BLUE=$'\033[34m'; CYAN=$'\033[36m'; MAGENTA=$'\033[35m'
+    RESET=$'\033[0m'
+    TICK="✓"; CROSS="✗"; ARROW="›"; BULLET="•"; RULE="─"
+  fi
+}
 
-die() { printf '%sfatal:%s %s\n' "$RED" "$RESET" "$*" >&2; exit 1; }
-note() { printf '%s%s%s\n' "$DIM" "$*" "$RESET" >&2; }
+term_cols() {
+  cols="${COLUMNS:-}"
+  [ -z "$cols" ] && cols="$(tput cols 2>/dev/null)"
+  case "$cols" in ''|*[!0-9]*) cols=100 ;; esac
+  [ "$cols" -lt 60 ] && cols=60
+  printf '%s' "$cols"
+}
+
+rule() {
+  width="$(term_cols)"; line=""
+  i=0; while [ "$i" -lt "$width" ]; do line="$line$RULE"; i=$((i + 1)); done
+  printf '%s%s%s\n' "$DIM" "$line" "$RESET"
+}
+
+die()  { printf '%s%s fatal%s %s\n' "$RED" "$CROSS" "$RESET" "$*" >&2; exit 1; }
+warn() { printf '%s!%s %s\n' "$YELLOW" "$RESET" "$*" >&2; }
+note() { [ "$QUIET" -eq 1 ] || printf '%s%s%s\n' "$DIM" "$*" "$RESET" >&2; }
+info() { [ "$QUIET" -eq 1 ] || printf '%s\n' "$*"; }
+trace() { [ "$VERBOSE" -eq 1 ] && printf '      %s%s %s%s\n' "$DIM" "$BULLET" "$*" "$RESET" >&2; return 0; }
+
 lower() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
+
+# Normalise a prompt answer: trim spaces, lowercase, so Y / y / YES / " Yes "
+# all land on the same branch of the case statement.
+answer() { printf '%s' "$1" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]'; }
+
+# Older branches read as more disposable — colour the age accordingly.
+age_color() {
+  if   [ "$1" -ge 180 ]; then printf '%s' "$RED"
+  elif [ "$1" -ge 90 ];  then printf '%s' "$YELLOW"
+  else printf '%s' "$GREEN"
+  fi
+}
+
+merged_color() {
+  case "$1" in
+    PR\ *)       printf '%s' "$CYAN" ;;
+    squash*)     printf '%s' "$MAGENTA" ;;
+    *)           printf '%s' "$BLUE" ;;
+  esac
+}
+
+truncate_to() { # <string> <width>
+  if [ ${#1} -le "$2" ]; then printf '%s' "$1"
+  else printf '%s…' "$(printf '%s' "$1" | cut -c1-$(( $2 - 1 )))"
+  fi
+}
+
+plural() { # <count> <singular> — branch/branches, repo/repos
+  if [ "$1" -eq 1 ]; then printf '%s' "$2"; return 0; fi
+  case "$2" in
+    *s|*x|*ch|*sh) printf '%ses' "$2" ;;
+    *) printf '%ss' "$2" ;;
+  esac
+}
 
 usage() {
   awk 'NR>1 && /^#/ {sub(/^# ?/, ""); print; next} NR>1 {exit}' "$0"
@@ -69,8 +132,13 @@ Options:
   --no-fetch          Skip 'git fetch' (faster, but works off stale refs)
   --include-protected Do not skip sprint/backup/archive/release-style branches
   --protect REGEX     Override the protected-branch pattern
+  -v, --verbose       Say why each branch was skipped
+  -q, --quiet         Only the results, no progress
+  --color WHEN        always | never | auto (default: auto; NO_COLOR honoured)
   -h, --help          This text
   --version           Print version
+
+Answers to every prompt are case-insensitive (y/Y/yes, a/A/all, q/Q/quit...).
 
 Config: put one repo path per line in
   $CONFIG_DIR/repos
@@ -93,13 +161,20 @@ while [ $# -gt 0 ]; do
     --no-fetch) DO_FETCH=0; shift ;;
     --include-protected) INCLUDE_PROTECTED=1; shift ;;
     --protect) PROTECT_RE="${2:?--protect needs a regex}"; shift 2 ;;
-    -h|--help) usage; exit 0 ;;
+    -v|--verbose) VERBOSE=1; shift ;;
+    -q|--quiet) QUIET=1; shift ;;
+    --color) COLOR="$(lower "${2:?--color needs always|never|auto}")"; shift 2 ;;
+    --no-color) COLOR=never; shift ;;
+    -h|--help) COLOR="$COLOR"; setup_colors; usage; exit 0 ;;
     --version) echo "git-sweep-branches $VERSION"; exit 0 ;;
-    *) die "unknown option: $1 (try --help)" ;;
+    *) setup_colors; die "unknown option: $1 (try --help)" ;;
   esac
 done
 
+setup_colors
+
 case "$MODE" in ""|all|repo|one) ;; *) die "--mode must be all, repo or one" ;; esac
+case "$COLOR" in always|never|auto) ;; *) die "--color must be always, never or auto" ;; esac
 case "$AGE_DAYS" in ''|*[!0-9]*) die "--days must be a whole number" ;; esac
 
 command -v git >/dev/null || die "git is not installed"
@@ -124,11 +199,21 @@ fi
 [ ${#REPOS[@]} -gt 0 ] || die "no repositories to scan (try --repo PATH)"
 
 CUTOFF=$(( $(date +%s) - AGE_DAYS * 86400 ))
+STARTED=$(date +%s)
 FOUND="$(mktemp "${TMPDIR:-/tmp}/git-sweep.XXXXXX")"
 trap 'rm -f "$FOUND"' EXIT
 
-[ "$JSON" -eq 1 ] || printf '%sScanning %d repositories for branches merged and idle > %d days...%s\n\n' \
-  "$BOLD" "${#REPOS[@]}" "$AGE_DAYS" "$RESET"
+# Why branches were passed over — printed as one honest summary at the end.
+sk_protected=0; sk_openpr=0; sk_checkedout=0; sk_notmine=0; sk_recent=0; sk_unmerged=0
+examined=0
+
+if [ "$JSON" -eq 0 ] && [ "$QUIET" -eq 0 ]; then
+  echo
+  printf '%s%s git-sweep-branches %s%s%s\n' "$BOLD" "$ARROW" "$DIM" "v$VERSION" "$RESET"
+  printf '%s  %d %s %s merged %s idle > %d days%s\n' \
+    "$DIM" "${#REPOS[@]}" "$(plural ${#REPOS[@]} repo)" "$BULLET" "$BULLET" "$AGE_DAYS" "$RESET"
+  echo
+fi
 
 scanned=0
 for repo in "${REPOS[@]}"; do
@@ -139,11 +224,13 @@ for repo in "${REPOS[@]}"; do
   origin_url="$(git remote get-url origin 2>/dev/null)"
   case "$origin_url" in
     *github.com*) ;;
-    *) note "skip $name (no GitHub origin)"; continue ;;
+    *) trace "$name skipped — origin is not GitHub"; continue ;;
   esac
 
   scanned=$((scanned + 1))
-  [ "$JSON" -eq 1 ] || printf '%s  [%d/%d] %s%s' "$DIM" "$scanned" "${#REPOS[@]}" "$name" "$RESET" >&2
+  [ "$JSON" -eq 1 ] || [ "$QUIET" -eq 1 ] ||
+    printf '  %s%2d/%-2d%s %s%-26s%s' "$DIM" "$scanned" "${#REPOS[@]}" "$RESET" \
+      "$CYAN" "$(truncate_to "$name" 26)" "$RESET" >&2
 
   [ "$DO_FETCH" -eq 1 ] && git fetch --quiet origin 2>/dev/null
 
@@ -157,7 +244,8 @@ for repo in "${REPOS[@]}"; do
       [ -n "$me" ] && emails=("$me")
     fi
     if [ ${#emails[@]} -eq 0 ]; then
-      note " — no user.email configured, skipping"; continue
+      [ "$QUIET" -eq 1 ] || printf '%sno user.email — skipped%s\n' "$YELLOW" "$RESET" >&2
+      continue
     fi
   fi
 
@@ -165,8 +253,10 @@ for repo in "${REPOS[@]}"; do
   [ -z "$default" ] && default="$(git symbolic-ref -q --short refs/remotes/origin/HEAD 2>/dev/null | sed 's#^origin/##')"
   [ -z "$default" ] && default=main
   git rev-parse --verify -q "refs/remotes/origin/$default" >/dev/null || default=master
-  git rev-parse --verify -q "refs/remotes/origin/$default" >/dev/null || {
-    note " — no default branch found, skipping"; continue; }
+  if ! git rev-parse --verify -q "refs/remotes/origin/$default" >/dev/null; then
+    [ "$QUIET" -eq 1 ] || printf '%sno default branch — skipped%s\n' "$YELLOW" "$RESET" >&2
+    continue
+  fi
 
   into_refs=("refs/remotes/origin/$default")
   if [ ${#EXTRA_INTO[@]} -gt 0 ]; then
@@ -182,27 +272,40 @@ for repo in "${REPOS[@]}"; do
   # Branches checked out here or in any linked worktree cannot be swept.
   checked_out="$(git worktree list --porcelain 2>/dev/null | sed -n 's#^branch refs/heads/##p')"
 
-  count=0
+  count=0; seen=0
   while IFS= read -r br; do
     [ -z "$br" ] && continue
+    seen=$((seen + 1)); examined=$((examined + 1))
+
     [ "$br" = "$default" ] && continue
-    if [ "$INCLUDE_PROTECTED" -eq 0 ]; then
-      [[ "$br" =~ $PROTECT_RE ]] && continue
+    if [ "$INCLUDE_PROTECTED" -eq 0 ] && [[ "$br" =~ $PROTECT_RE ]]; then
+      sk_protected=$((sk_protected + 1)); trace "$name/$br — protected name"; continue
     fi
-    printf '%s\n' "$open_prs" | grep -qxF "$br" && continue
-    printf '%s\n' "$checked_out" | grep -qxF "$br" && continue
+    if printf '%s\n' "$open_prs" | grep -qxF "$br"; then
+      sk_openpr=$((sk_openpr + 1)); trace "$name/$br — has an open PR"; continue
+    fi
+    if printf '%s\n' "$checked_out" | grep -qxF "$br"; then
+      sk_checkedout=$((sk_checkedout + 1)); trace "$name/$br — checked out"; continue
+    fi
 
     ref="refs/remotes/origin/$br"
     git rev-parse --verify -q "$ref" >/dev/null || continue
 
     read -r ts email <<<"$(git log -1 --format='%ct %ae' "$ref" 2>/dev/null)"
     [ -z "${ts:-}" ] && continue
-    [ "$ts" -gt "$CUTOFF" ] && continue
+
+    if [ "$ts" -gt "$CUTOFF" ]; then
+      sk_recent=$((sk_recent + 1))
+      trace "$name/$br — only $(( ( $(date +%s) - ts ) / 86400 ))d old"
+      continue
+    fi
 
     if [ "$ALL_AUTHORS" -eq 0 ]; then
       match=0
       for e in "${emails[@]}"; do [ "$email" = "$e" ] && match=1 && break; done
-      [ "$match" -eq 1 ] || continue
+      if [ "$match" -eq 0 ]; then
+        sk_notmine=$((sk_notmine + 1)); trace "$name/$br — tip by $email"; continue
+      fi
     fi
 
     # Merged: contained in an integration branch, or a merged PR, or every
@@ -210,7 +313,7 @@ for repo in "${REPOS[@]}"; do
     merged=""
     for into in "${into_refs[@]}"; do
       if git merge-base --is-ancestor "$ref" "$into" 2>/dev/null; then
-        merged="merged into ${into#refs/remotes/origin/}"; break
+        merged="in ${into#refs/remotes/origin/}"; break
       fi
     done
     if [ -z "$merged" ]; then
@@ -222,11 +325,13 @@ for repo in "${REPOS[@]}"; do
         ahead="$(git rev-list --count "refs/remotes/origin/$default..$ref" 2>/dev/null)"
         if [ -n "$ahead" ] && [ "$ahead" -le 200 ] &&
            [ "$(git cherry "refs/remotes/origin/$default" "$ref" 2>/dev/null | grep -c '^+')" -eq 0 ]; then
-          merged="squash-merged"
+          merged="squashed into $default"
         fi
       fi
     fi
-    [ -n "$merged" ] || continue
+    if [ -z "$merged" ]; then
+      sk_unmerged=$((sk_unmerged + 1)); trace "$name/$br — not merged anywhere"; continue
+    fi
 
     printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
       "$name" "$repo" "$br" "$(git log -1 --format='%cs' "$ref")" \
@@ -234,10 +339,18 @@ for repo in "${REPOS[@]}"; do
     count=$((count + 1))
   done < <(git ls-remote --heads origin 2>/dev/null | sed 's#.*refs/heads/##' | sort -u)
 
-  [ "$JSON" -eq 1 ] || printf ' — %d\n' "$count" >&2
+  if [ "$JSON" -eq 0 ] && [ "$QUIET" -eq 0 ]; then
+    if [ "$count" -gt 0 ]; then
+      printf '%s%s %2d%s %sof %d remote %s%s\n' \
+        "$GREEN" "$TICK" "$count" "$RESET" "$DIM" "$seen" "$(plural "$seen" branch)" "$RESET" >&2
+    else
+      printf '%s%s  0 of %d%s\n' "$DIM" "$BULLET" "$seen" "$RESET" >&2
+    fi
+  fi
 done
 
 total="$(wc -l < "$FOUND" | tr -d ' ')"
+elapsed=$(( $(date +%s) - STARTED ))
 
 # -------------------------------------------------------------------- list --
 if [ "$JSON" -eq 1 ]; then
@@ -248,37 +361,70 @@ if [ "$JSON" -eq 1 ]; then
   exit 0
 fi
 
+skip_summary() {
+  parts=""
+  [ "$sk_notmine"    -gt 0 ] && parts="$parts $sk_notmine not yours,"
+  [ "$sk_unmerged"   -gt 0 ] && parts="$parts $sk_unmerged unmerged,"
+  [ "$sk_recent"     -gt 0 ] && parts="$parts $sk_recent too recent,"
+  [ "$sk_protected"  -gt 0 ] && parts="$parts $sk_protected protected,"
+  [ "$sk_openpr"     -gt 0 ] && parts="$parts $sk_openpr open PR,"
+  [ "$sk_checkedout" -gt 0 ] && parts="$parts $sk_checkedout checked out,"
+  [ -n "$parts" ] && printf 'passed over:%s' "${parts%,}"
+  return 0
+}
+
 echo
 if [ "$total" -eq 0 ]; then
-  printf '%sNothing to sweep.%s\n' "$GREEN" "$RESET"
+  printf '%s%s Nothing to sweep.%s %s%d %s examined in %ds%s\n' \
+    "$GREEN" "$TICK" "$RESET" "$DIM" "$examined" "$(plural "$examined" branch)" "$elapsed" "$RESET"
+  [ "$QUIET" -eq 1 ] || { s="$(skip_summary)"; [ -n "$s" ] && printf '%s  %s%s\n' "$DIM" "$s" "$RESET"; }
   exit 0
 fi
 
+BRANCH_W=$(( $(term_cols) - 40 ))
+[ "$BRANCH_W" -gt 60 ] && BRANCH_W=60
+[ "$BRANCH_W" -lt 24 ] && BRANCH_W=24
+
+rule
 current_repo=""
 while IFS=$'\t' read -r name path br date age sha merged; do
   if [ "$name" != "$current_repo" ]; then
     current_repo="$name"
-    printf '\n%s%s%s %s(%s)%s\n' "$BOLD" "$name" "$RESET" "$DIM" "$path" "$RESET"
+    n="$(awk -F'\t' -v r="$name" '$1==r' "$FOUND" | wc -l | tr -d ' ')"
+    printf '\n%s%s%s %s%s %s%s\n' \
+      "$BOLD$CYAN" "$name" "$RESET" "$DIM" "$path" "$BULLET $n" "$RESET"
   fi
-  printf '  %-52s %s  %4sd  %s%s%s\n' "$br" "$date" "$age" "$DIM" "$merged" "$RESET"
+  printf '  %-*s %s%s%s  %s%4sd%s  %s%s%s\n' \
+    "$BRANCH_W" "$(truncate_to "$br" "$BRANCH_W")" \
+    "$DIM" "$date" "$RESET" \
+    "$(age_color "$age")" "$age" "$RESET" \
+    "$(merged_color "$merged")$DIM" "$merged" "$RESET"
 done < "$FOUND"
 
-printf '\n%s%d branch(es) across %d repo(s).%s\n' \
-  "$BOLD" "$total" "$(cut -f1 "$FOUND" | sort -u | wc -l | tr -d ' ')" "$RESET"
+echo
+rule
+repos_hit="$(cut -f1 "$FOUND" | sort -u | wc -l | tr -d ' ')"
+printf '%s%d %s%s across %s%d %s%s %s%s%d examined %s %ds%s\n' \
+  "$BOLD" "$total" "$(plural "$total" branch)" "$RESET" \
+  "$BOLD" "$repos_hit" "$(plural "$repos_hit" repo)" "$RESET" \
+  "$DIM" "$BULLET " "$examined" "$BULLET" "$elapsed" "$RESET"
+s="$(skip_summary)"; [ -n "$s" ] && printf '%s%s%s\n' "$DIM" "$s" "$RESET"
 
 [ "$LIST_ONLY" -eq 1 ] && exit 0
 [ -t 0 ] || { note "not a terminal — listing only"; exit 0; }
 
 # ------------------------------------------------------------------ delete --
 if [ -z "$MODE" ]; then
-  printf '\nDelete these remote branches?\n'
+  printf '\n%sDelete these remote branches?%s\n' "$BOLD" "$RESET"
   printf '  %s[a]%s all at once   %s[r]%s repo by repo   %s[o]%s one by one   %s[q]%s quit\n' \
-    "$CYAN" "$RESET" "$CYAN" "$RESET" "$CYAN" "$RESET" "$CYAN" "$RESET"
-  printf '> '
-  read -r answer < /dev/tty
-  case "$(lower "$answer")" in
-    a|all) MODE=all ;; r|repo) MODE=repo ;; o|one) MODE=one ;;
-    *) echo "Nothing deleted."; exit 0 ;;
+    "$GREEN" "$RESET" "$CYAN" "$RESET" "$CYAN" "$RESET" "$DIM" "$RESET"
+  printf '%s%s%s ' "$BOLD" "$ARROW" "$RESET"
+  read -r reply < /dev/tty
+  case "$(answer "$reply")" in
+    a|all)  MODE=all ;;
+    r|repo|repos) MODE=repo ;;
+    o|one|onebyone) MODE=one ;;
+    *) printf '%s%s nothing deleted%s\n' "$DIM" "$BULLET" "$RESET"; exit 0 ;;
   esac
 fi
 
@@ -299,16 +445,18 @@ delete_batch() {
   done
 
   if git push --quiet origin --delete "$@" 2>/dev/null; then
-    printf '  %s✓%s deleted %d branch(es) in %s\n' "$GREEN" "$RESET" "$#" "$name"
+    printf '  %s%s deleted %d %s%s %sin %s%s\n' \
+      "$GREEN" "$TICK" "$#" "$(plural $# branch)" "$RESET" "$DIM" "$name" "$RESET"
     deleted=$((deleted + $#))
   else
     # One bad ref fails the whole push, so fall back to one at a time.
     for b in "$@"; do
       if git push --quiet origin --delete "$b" 2>/dev/null; then
-        printf '  %s✓%s %s/%s\n' "$GREEN" "$RESET" "$name" "$b"; deleted=$((deleted + 1))
+        printf '  %s%s%s %s%s/%s%s\n' "$GREEN" "$TICK" "$RESET" "$DIM" "$name" "$RESET" "$b"
+        deleted=$((deleted + 1))
       else
-        printf '  %s✗%s %s/%s (push failed — protected on GitHub, or already gone)\n' \
-          "$RED" "$RESET" "$name" "$b"
+        printf '  %s%s%s %s/%s %s(push refused — protected on GitHub, or already gone)%s\n' \
+          "$RED" "$CROSS" "$RESET" "$name" "$b" "$DIM" "$RESET"
         failed=$((failed + 1))
       fi
     done
@@ -324,12 +472,13 @@ delete_batch() {
   git fetch --quiet --prune origin 2>/dev/null
 }
 
+echo
 case "$MODE" in
   all)
-    printf '\nDelete all %d branch(es)? [y/N] ' "$total"
+    printf '%sDelete all %d %s?%s [y/N] ' "$BOLD" "$total" "$(plural "$total" branch)" "$RESET"
     read -r confirm < /dev/tty
-    case "$(lower "$confirm")" in
-      y*)
+    case "$(answer "$confirm")" in
+      y|yes)
         while IFS= read -r repo_name; do
           repo_path="$(awk -F'\t' -v r="$repo_name" '$1==r{print $2; exit}' "$FOUND")"
           branches=()
@@ -338,7 +487,7 @@ case "$MODE" in
           delete_batch "$repo_path" "$repo_name" "${branches[@]}"
         done < <(cut -f1 "$FOUND" | sort -u)
         ;;
-      *) skipped=$total; echo "Nothing deleted." ;;
+      *) skipped=$total; printf '%s%s nothing deleted%s\n' "$DIM" "$BULLET" "$RESET" ;;
     esac
     ;;
 
@@ -348,14 +497,18 @@ case "$MODE" in
       branches=()
       while IFS= read -r b; do branches[${#branches[@]}]="$b"; done \
         < <(awk -F'\t' -v r="$repo_name" '$1==r{print $3}' "$FOUND")
-      printf '\n%s%s%s — %d branch(es):\n' "$BOLD" "$repo_name" "$RESET" "${#branches[@]}"
-      printf '    %s\n' "${branches[@]}"
-      printf 'Delete all of these? [y/N/q] '
+      printf '\n%s%s%s %s%d %s%s\n' "$BOLD$CYAN" "$repo_name" "$RESET" \
+        "$DIM" "${#branches[@]}" "$(plural ${#branches[@]} branch)" "$RESET"
+      for b in "${branches[@]}"; do
+        printf '    %s%s%s %s\n' "$DIM" "$BULLET" "$RESET" "$b"
+      done
+      printf '%sDelete all of these?%s [y/N/q] ' "$BOLD" "$RESET"
       read -r confirm < /dev/tty
-      case "$(lower "$confirm")" in
-        q*) echo "Stopped."; break ;;
-        y*) delete_batch "$repo_path" "$repo_name" "${branches[@]}" ;;
-        *)  skipped=$((skipped + ${#branches[@]})); printf '  %sskipped%s\n' "$YELLOW" "$RESET" ;;
+      case "$(answer "$confirm")" in
+        q|quit) printf '%s%s stopped%s\n' "$DIM" "$BULLET" "$RESET"; break ;;
+        y|yes)  delete_batch "$repo_path" "$repo_name" "${branches[@]}" ;;
+        *) skipped=$((skipped + ${#branches[@]}))
+           printf '  %sskipped%s\n' "$YELLOW" "$RESET" ;;
       esac
     done < <(cut -f1 "$FOUND" | sort -u)
     ;;
@@ -364,23 +517,33 @@ case "$MODE" in
     idx=0
     while IFS=$'\t' read -r name path br date age sha merged; do
       idx=$((idx + 1))
-      printf '\n%s[%d/%d] %s/%s%s\n' "$BOLD" "$idx" "$total" "$name" "$br" "$RESET"
-      printf '  last commit %s (%s days ago, %s) — %s\n' "$date" "$age" "$sha" "$merged"
-      printf 'Delete? [y/N/q] '
+      printf '\n%s[%d/%d]%s %s%s%s/%s%s%s\n' \
+        "$DIM" "$idx" "$total" "$RESET" "$CYAN" "$name" "$RESET" "$BOLD" "$br" "$RESET"
+      printf '      %s%s%s  %s%sd old%s  %s%s%s  %s%s%s\n' \
+        "$DIM" "$date" "$RESET" "$(age_color "$age")" "$age" "$RESET" \
+        "$DIM" "$sha" "$RESET" "$(merged_color "$merged")$DIM" "$merged" "$RESET"
+      printf '%sDelete?%s [y/N/q] ' "$BOLD" "$RESET"
       read -r confirm < /dev/tty
-      case "$(lower "$confirm")" in
-        q*) echo "Stopped."; break ;;
-        y*) delete_batch "$path" "$name" "$br" ;;
-        *)  skipped=$((skipped + 1)); printf '  %sskipped%s\n' "$YELLOW" "$RESET" ;;
+      case "$(answer "$confirm")" in
+        q|quit) printf '%s%s stopped%s\n' "$DIM" "$BULLET" "$RESET"; break ;;
+        y|yes)  delete_batch "$path" "$name" "$br" ;;
+        *) skipped=$((skipped + 1)); printf '  %sskipped%s\n' "$YELLOW" "$RESET" ;;
       esac
     done < "$FOUND"
     ;;
 esac
 
 echo
-printf '%sDone.%s deleted=%d skipped=%d failed=%d\n' "$BOLD" "$RESET" "$deleted" "$skipped" "$failed"
+rule
+printf '%sdeleted %s%d%s' "$BOLD" "$GREEN" "$deleted" "$RESET"
+printf '%s  %s  skipped %s%d%s' "$DIM" "$BULLET" "$YELLOW" "$skipped" "$RESET"
+if [ "$failed" -gt 0 ]; then
+  printf '%s  %s  failed %s%d%s\n' "$DIM" "$BULLET" "$RED" "$failed" "$RESET"
+else
+  printf '\n'
+fi
+
 if [ "$deleted" -gt 0 ]; then
-  printf 'Log: %s\n' "$LOG"
-  printf '%sRestore any of them with:%s cd <repo> && git push origin <sha>:refs/heads/<branch>\n' \
-    "$DIM" "$RESET"
+  printf '%slog%s   %s\n' "$DIM" "$RESET" "$LOG"
+  printf '%sundo%s  cd <repo> && git push origin <sha>:refs/heads/<branch>\n' "$DIM" "$RESET"
 fi
