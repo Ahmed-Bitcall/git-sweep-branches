@@ -1,0 +1,386 @@
+#!/usr/bin/env bash
+# git-sweep-branches — find remote branches that are yours, already merged, and
+# older than N days, then optionally delete them (all / per repo / one by one).
+#
+# Read-only until you answer the deletion prompt. Every deletion is logged with
+# the branch tip SHA so it can be restored.
+#
+#   git-sweep-branches                     # scan every repo, list, then ask
+#   git-sweep-branches --list              # list only, never prompt
+#   git-sweep-branches --days 60           # older than 60 days instead of 30
+#   git-sweep-branches --repo ~/work/api --repo ~/work/web
+#   git-sweep-branches --mode one --prune-local
+#
+# Requires: git, gh (authenticated). Works with bash 3.2+ (stock macOS bash).
+#
+# https://github.com/Ahmed-Bitcall/git-sweep-branches — MIT licensed.
+
+set -uo pipefail
+
+VERSION="1.1.0"
+AGE_DAYS=30
+LIST_ONLY=0
+JSON=0
+MODE=""
+PRUNE_LOCAL=0
+DO_FETCH=1
+ALL_AUTHORS=0
+INCLUDE_PROTECTED=0
+AUTHORS=()
+REPOS=()
+EXTRA_INTO=()
+
+# Shared/integration refs that are merged-and-old by nature — deleting them
+# throws away the only pointer to a snapshot someone may still need.
+PROTECT_RE='^(main|master|develop|dev|staging|production|release-candidate|preview|release|HEAD)$|sprint|^backup/|^archive/|^prod/|^demo|^release-please|^dependabot/|^revert-'
+
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/git-sweep-branches"
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/git-sweep-branches"
+
+if [ -t 1 ]; then
+  BOLD=$'\033[1m'; DIM=$'\033[2m'; RED=$'\033[31m'; GREEN=$'\033[32m'
+  YELLOW=$'\033[33m'; CYAN=$'\033[36m'; RESET=$'\033[0m'
+else
+  BOLD=""; DIM=""; RED=""; GREEN=""; YELLOW=""; CYAN=""; RESET=""
+fi
+
+die() { printf '%sfatal:%s %s\n' "$RED" "$RESET" "$*" >&2; exit 1; }
+note() { printf '%s%s%s\n' "$DIM" "$*" "$RESET" >&2; }
+lower() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
+
+usage() {
+  awk 'NR>1 && /^#/ {sub(/^# ?/, ""); print; next} NR>1 {exit}' "$0"
+  cat <<EOF
+
+Options:
+  --days N            Minimum age in days of the last commit (default: $AGE_DAYS)
+  --author EMAIL      Branch tip author to match; repeatable
+                      (default: each repo's git config user.email)
+  --all-authors       Match every author, not just yours
+  --repo PATH         Repo to scan; repeatable (default: config file, else
+                      git repos found under \$HOME up to 2 levels deep)
+  --into REF          Extra branch that also counts as "merged"; repeatable
+                      (default: the repo's GitHub default branch)
+  --list              Only print the list, never offer to delete
+  --json              Print the list as JSON and exit (implies --list)
+  --mode all|repo|one Skip the mode question and use this one
+  --prune-local       Also delete the matching local branch, when it is not
+                      checked out and points at the same commit
+  --no-fetch          Skip 'git fetch' (faster, but works off stale refs)
+  --include-protected Do not skip sprint/backup/archive/release-style branches
+  --protect REGEX     Override the protected-branch pattern
+  -h, --help          This text
+  --version           Print version
+
+Config: put one repo path per line in
+  $CONFIG_DIR/repos
+Deletion log (with restore commands):
+  $STATE_DIR/
+EOF
+}
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --days) AGE_DAYS="${2:?--days needs a number}"; shift 2 ;;
+    --author) AUTHORS[${#AUTHORS[@]}]="${2:?--author needs an email}"; shift 2 ;;
+    --all-authors) ALL_AUTHORS=1; shift ;;
+    --repo) REPOS[${#REPOS[@]}]="${2:?--repo needs a path}"; shift 2 ;;
+    --into) EXTRA_INTO[${#EXTRA_INTO[@]}]="${2:?--into needs a ref}"; shift 2 ;;
+    --list|--list-only|-n) LIST_ONLY=1; shift ;;
+    --json) JSON=1; LIST_ONLY=1; shift ;;
+    --mode) MODE="$(lower "${2:?--mode needs all|repo|one}")"; shift 2 ;;
+    --prune-local) PRUNE_LOCAL=1; shift ;;
+    --no-fetch) DO_FETCH=0; shift ;;
+    --include-protected) INCLUDE_PROTECTED=1; shift ;;
+    --protect) PROTECT_RE="${2:?--protect needs a regex}"; shift 2 ;;
+    -h|--help) usage; exit 0 ;;
+    --version) echo "git-sweep-branches $VERSION"; exit 0 ;;
+    *) die "unknown option: $1 (try --help)" ;;
+  esac
+done
+
+case "$MODE" in ""|all|repo|one) ;; *) die "--mode must be all, repo or one" ;; esac
+case "$AGE_DAYS" in ''|*[!0-9]*) die "--days must be a whole number" ;; esac
+
+command -v git >/dev/null || die "git is not installed"
+command -v gh  >/dev/null || die "gh is not installed — see https://cli.github.com"
+gh auth status >/dev/null 2>&1 || die "gh is not authenticated — run: gh auth login"
+
+# ---------------------------------------------------------------- repo list --
+if [ ${#REPOS[@]} -eq 0 ] && [ -r "$CONFIG_DIR/repos" ]; then
+  while IFS= read -r line; do
+    line="${line%%#*}"
+    line="$(printf '%s' "$line" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+    [ -n "$line" ] && REPOS[${#REPOS[@]}]="${line/#\~/$HOME}"
+  done < "$CONFIG_DIR/repos"
+fi
+
+if [ ${#REPOS[@]} -eq 0 ]; then
+  while IFS= read -r gitdir; do
+    REPOS[${#REPOS[@]}]="${gitdir%/.git}"
+  done < <(find "$HOME" -maxdepth 2 -name .git -type d -not -path '*/node_modules/*' -not -path "$HOME/.*" 2>/dev/null | sort)
+fi
+
+[ ${#REPOS[@]} -gt 0 ] || die "no repositories to scan (try --repo PATH)"
+
+CUTOFF=$(( $(date +%s) - AGE_DAYS * 86400 ))
+FOUND="$(mktemp "${TMPDIR:-/tmp}/git-sweep.XXXXXX")"
+trap 'rm -f "$FOUND"' EXIT
+
+[ "$JSON" -eq 1 ] || printf '%sScanning %d repositories for branches merged and idle > %d days...%s\n\n' \
+  "$BOLD" "${#REPOS[@]}" "$AGE_DAYS" "$RESET"
+
+scanned=0
+for repo in "${REPOS[@]}"; do
+  [ -d "$repo/.git" ] || continue
+  cd "$repo" 2>/dev/null || continue
+  name="$(basename "$repo")"
+
+  origin_url="$(git remote get-url origin 2>/dev/null)"
+  case "$origin_url" in
+    *github.com*) ;;
+    *) note "skip $name (no GitHub origin)"; continue ;;
+  esac
+
+  scanned=$((scanned + 1))
+  [ "$JSON" -eq 1 ] || printf '%s  [%d/%d] %s%s' "$DIM" "$scanned" "${#REPOS[@]}" "$name" "$RESET" >&2
+
+  [ "$DO_FETCH" -eq 1 ] && git fetch --quiet origin 2>/dev/null
+
+  # Whose branches are we sweeping?
+  emails=()
+  if [ "$ALL_AUTHORS" -eq 0 ]; then
+    if [ ${#AUTHORS[@]} -gt 0 ]; then
+      emails=("${AUTHORS[@]}")
+    else
+      me="$(git config user.email)"
+      [ -n "$me" ] && emails=("$me")
+    fi
+    if [ ${#emails[@]} -eq 0 ]; then
+      note " — no user.email configured, skipping"; continue
+    fi
+  fi
+
+  default="$(gh repo view --json defaultBranchRef -q .defaultBranchRef.name 2>/dev/null)"
+  [ -z "$default" ] && default="$(git symbolic-ref -q --short refs/remotes/origin/HEAD 2>/dev/null | sed 's#^origin/##')"
+  [ -z "$default" ] && default=main
+  git rev-parse --verify -q "refs/remotes/origin/$default" >/dev/null || default=master
+  git rev-parse --verify -q "refs/remotes/origin/$default" >/dev/null || {
+    note " — no default branch found, skipping"; continue; }
+
+  into_refs=("refs/remotes/origin/$default")
+  if [ ${#EXTRA_INTO[@]} -gt 0 ]; then
+    for extra in "${EXTRA_INTO[@]}"; do
+      git rev-parse --verify -q "refs/remotes/origin/$extra" >/dev/null &&
+        into_refs[${#into_refs[@]}]="refs/remotes/origin/$extra"
+    done
+  fi
+
+  open_prs="$(gh pr list --state open --limit 500 --json headRefName -q '.[].headRefName' 2>/dev/null)"
+  merged_prs="$(gh pr list --state merged --limit 500 --json number,headRefName,mergedAt \
+    -q '.[] | .headRefName + "\t#" + (.number|tostring) + " " + (.mergedAt|split("T")[0])' 2>/dev/null)"
+  # Branches checked out here or in any linked worktree cannot be swept.
+  checked_out="$(git worktree list --porcelain 2>/dev/null | sed -n 's#^branch refs/heads/##p')"
+
+  count=0
+  while IFS= read -r br; do
+    [ -z "$br" ] && continue
+    [ "$br" = "$default" ] && continue
+    if [ "$INCLUDE_PROTECTED" -eq 0 ]; then
+      [[ "$br" =~ $PROTECT_RE ]] && continue
+    fi
+    printf '%s\n' "$open_prs" | grep -qxF "$br" && continue
+    printf '%s\n' "$checked_out" | grep -qxF "$br" && continue
+
+    ref="refs/remotes/origin/$br"
+    git rev-parse --verify -q "$ref" >/dev/null || continue
+
+    read -r ts email <<<"$(git log -1 --format='%ct %ae' "$ref" 2>/dev/null)"
+    [ -z "${ts:-}" ] && continue
+    [ "$ts" -gt "$CUTOFF" ] && continue
+
+    if [ "$ALL_AUTHORS" -eq 0 ]; then
+      match=0
+      for e in "${emails[@]}"; do [ "$email" = "$e" ] && match=1 && break; done
+      [ "$match" -eq 1 ] || continue
+    fi
+
+    # Merged: contained in an integration branch, or a merged PR, or every
+    # commit already upstream by patch-id (how squash merges look).
+    merged=""
+    for into in "${into_refs[@]}"; do
+      if git merge-base --is-ancestor "$ref" "$into" 2>/dev/null; then
+        merged="merged into ${into#refs/remotes/origin/}"; break
+      fi
+    done
+    if [ -z "$merged" ]; then
+      pr="$(printf '%s\n' "$merged_prs" | awk -F'\t' -v b="$br" '$1==b{print $2; exit}')"
+      if [ -n "$pr" ]; then
+        merged="PR $pr"
+      else
+        # git cherry compares by patch-id; cap the work on runaway branches.
+        ahead="$(git rev-list --count "refs/remotes/origin/$default..$ref" 2>/dev/null)"
+        if [ -n "$ahead" ] && [ "$ahead" -le 200 ] &&
+           [ "$(git cherry "refs/remotes/origin/$default" "$ref" 2>/dev/null | grep -c '^+')" -eq 0 ]; then
+          merged="squash-merged"
+        fi
+      fi
+    fi
+    [ -n "$merged" ] || continue
+
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+      "$name" "$repo" "$br" "$(git log -1 --format='%cs' "$ref")" \
+      "$(( ( $(date +%s) - ts ) / 86400 ))" "$(git rev-parse --short "$ref")" "$merged" >> "$FOUND"
+    count=$((count + 1))
+  done < <(git ls-remote --heads origin 2>/dev/null | sed 's#.*refs/heads/##' | sort -u)
+
+  [ "$JSON" -eq 1 ] || printf ' — %d\n' "$count" >&2
+done
+
+total="$(wc -l < "$FOUND" | tr -d ' ')"
+
+# -------------------------------------------------------------------- list --
+if [ "$JSON" -eq 1 ]; then
+  awk -F'\t' 'BEGIN{print "["; sep=""}
+    {gsub(/"/, "\\\"");
+     printf "%s  {\"repo\":\"%s\",\"path\":\"%s\",\"branch\":\"%s\",\"lastCommit\":\"%s\",\"ageDays\":%s,\"sha\":\"%s\",\"merged\":\"%s\"}\n", sep, $1, $2, $3, $4, $5, $6, $7; sep=","}
+    END{print "]"}' "$FOUND"
+  exit 0
+fi
+
+echo
+if [ "$total" -eq 0 ]; then
+  printf '%sNothing to sweep.%s\n' "$GREEN" "$RESET"
+  exit 0
+fi
+
+current_repo=""
+while IFS=$'\t' read -r name path br date age sha merged; do
+  if [ "$name" != "$current_repo" ]; then
+    current_repo="$name"
+    printf '\n%s%s%s %s(%s)%s\n' "$BOLD" "$name" "$RESET" "$DIM" "$path" "$RESET"
+  fi
+  printf '  %-52s %s  %4sd  %s%s%s\n' "$br" "$date" "$age" "$DIM" "$merged" "$RESET"
+done < "$FOUND"
+
+printf '\n%s%d branch(es) across %d repo(s).%s\n' \
+  "$BOLD" "$total" "$(cut -f1 "$FOUND" | sort -u | wc -l | tr -d ' ')" "$RESET"
+
+[ "$LIST_ONLY" -eq 1 ] && exit 0
+[ -t 0 ] || { note "not a terminal — listing only"; exit 0; }
+
+# ------------------------------------------------------------------ delete --
+if [ -z "$MODE" ]; then
+  printf '\nDelete these remote branches?\n'
+  printf '  %s[a]%s all at once   %s[r]%s repo by repo   %s[o]%s one by one   %s[q]%s quit\n' \
+    "$CYAN" "$RESET" "$CYAN" "$RESET" "$CYAN" "$RESET" "$CYAN" "$RESET"
+  printf '> '
+  read -r answer < /dev/tty
+  case "$(lower "$answer")" in
+    a|all) MODE=all ;; r|repo) MODE=repo ;; o|one) MODE=one ;;
+    *) echo "Nothing deleted."; exit 0 ;;
+  esac
+fi
+
+mkdir -p "$STATE_DIR"
+LOG="$STATE_DIR/deleted-$(date +%Y%m%d-%H%M%S).tsv"
+deleted=0; skipped=0; failed=0
+
+# delete_batch <repo-path> <repo-name> <branch...>
+delete_batch() {
+  path="$1"; name="$2"; shift 2
+  [ $# -eq 0 ] && return 0
+  cd "$path" || return 1
+
+  for b in "$@"; do
+    printf '%s\t%s\t%s\t%s\t%s\n' "$name" "$path" "$b" \
+      "$(git rev-parse "refs/remotes/origin/$b" 2>/dev/null)" \
+      "$(date +%Y-%m-%dT%H:%M:%S)" >> "$LOG"
+  done
+
+  if git push --quiet origin --delete "$@" 2>/dev/null; then
+    printf '  %s✓%s deleted %d branch(es) in %s\n' "$GREEN" "$RESET" "$#" "$name"
+    deleted=$((deleted + $#))
+  else
+    # One bad ref fails the whole push, so fall back to one at a time.
+    for b in "$@"; do
+      if git push --quiet origin --delete "$b" 2>/dev/null; then
+        printf '  %s✓%s %s/%s\n' "$GREEN" "$RESET" "$name" "$b"; deleted=$((deleted + 1))
+      else
+        printf '  %s✗%s %s/%s (push failed — protected on GitHub, or already gone)\n' \
+          "$RED" "$RESET" "$name" "$b"
+        failed=$((failed + 1))
+      fi
+    done
+  fi
+
+  if [ "$PRUNE_LOCAL" -eq 1 ]; then
+    for b in "$@"; do
+      git rev-parse --verify -q "refs/heads/$b" >/dev/null || continue
+      git branch -D "$b" >/dev/null 2>&1 &&
+        printf '    %slocal copy removed: %s%s\n' "$DIM" "$b" "$RESET"
+    done
+  fi
+  git fetch --quiet --prune origin 2>/dev/null
+}
+
+case "$MODE" in
+  all)
+    printf '\nDelete all %d branch(es)? [y/N] ' "$total"
+    read -r confirm < /dev/tty
+    case "$(lower "$confirm")" in
+      y*)
+        while IFS= read -r repo_name; do
+          repo_path="$(awk -F'\t' -v r="$repo_name" '$1==r{print $2; exit}' "$FOUND")"
+          branches=()
+          while IFS= read -r b; do branches[${#branches[@]}]="$b"; done \
+            < <(awk -F'\t' -v r="$repo_name" '$1==r{print $3}' "$FOUND")
+          delete_batch "$repo_path" "$repo_name" "${branches[@]}"
+        done < <(cut -f1 "$FOUND" | sort -u)
+        ;;
+      *) skipped=$total; echo "Nothing deleted." ;;
+    esac
+    ;;
+
+  repo)
+    while IFS= read -r repo_name; do
+      repo_path="$(awk -F'\t' -v r="$repo_name" '$1==r{print $2; exit}' "$FOUND")"
+      branches=()
+      while IFS= read -r b; do branches[${#branches[@]}]="$b"; done \
+        < <(awk -F'\t' -v r="$repo_name" '$1==r{print $3}' "$FOUND")
+      printf '\n%s%s%s — %d branch(es):\n' "$BOLD" "$repo_name" "$RESET" "${#branches[@]}"
+      printf '    %s\n' "${branches[@]}"
+      printf 'Delete all of these? [y/N/q] '
+      read -r confirm < /dev/tty
+      case "$(lower "$confirm")" in
+        q*) echo "Stopped."; break ;;
+        y*) delete_batch "$repo_path" "$repo_name" "${branches[@]}" ;;
+        *)  skipped=$((skipped + ${#branches[@]})); printf '  %sskipped%s\n' "$YELLOW" "$RESET" ;;
+      esac
+    done < <(cut -f1 "$FOUND" | sort -u)
+    ;;
+
+  one)
+    idx=0
+    while IFS=$'\t' read -r name path br date age sha merged; do
+      idx=$((idx + 1))
+      printf '\n%s[%d/%d] %s/%s%s\n' "$BOLD" "$idx" "$total" "$name" "$br" "$RESET"
+      printf '  last commit %s (%s days ago, %s) — %s\n' "$date" "$age" "$sha" "$merged"
+      printf 'Delete? [y/N/q] '
+      read -r confirm < /dev/tty
+      case "$(lower "$confirm")" in
+        q*) echo "Stopped."; break ;;
+        y*) delete_batch "$path" "$name" "$br" ;;
+        *)  skipped=$((skipped + 1)); printf '  %sskipped%s\n' "$YELLOW" "$RESET" ;;
+      esac
+    done < "$FOUND"
+    ;;
+esac
+
+echo
+printf '%sDone.%s deleted=%d skipped=%d failed=%d\n' "$BOLD" "$RESET" "$deleted" "$skipped" "$failed"
+if [ "$deleted" -gt 0 ]; then
+  printf 'Log: %s\n' "$LOG"
+  printf '%sRestore any of them with:%s cd <repo> && git push origin <sha>:refs/heads/<branch>\n' \
+    "$DIM" "$RESET"
+fi

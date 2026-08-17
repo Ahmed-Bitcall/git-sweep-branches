@@ -1,0 +1,46 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Syntax check
+        run: |
+          bash -n bin/git-sweep-branches
+          sh -n install.sh
+
+      - name: ShellCheck
+        uses: ludeeus/action-shellcheck@master
+        env:
+          SHELLCHECK_OPTS: -e SC2155
+        with:
+          scandir: .
+
+      - name: Help and version run without a repo
+        run: |
+          bash bin/git-sweep-branches --help > /dev/null
+          bash bin/git-sweep-branches --version
+
+  install:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install from checkout
+        run: GSB_NO_PATH_EDIT=1 INSTALL_DIR="$HOME/.local/bin" ./install.sh
+
+      - name: Installed script reports its version
+        run: "$HOME/.local/bin/git-sweep-branches --version"
+
+      - name: Uninstall
+        run: GSB_NO_PATH_EDIT=1 INSTALL_DIR="$HOME/.local/bin" ./install.sh --uninstall
