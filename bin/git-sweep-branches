@@ -165,7 +165,7 @@ while [ $# -gt 0 ]; do
     -q|--quiet) QUIET=1; shift ;;
     --color) COLOR="$(lower "${2:?--color needs always|never|auto}")"; shift 2 ;;
     --no-color) COLOR=never; shift ;;
-    -h|--help) COLOR="$COLOR"; setup_colors; usage; exit 0 ;;
+    -h|--help) setup_colors; usage; exit 0 ;;
     --version) echo "git-sweep-branches $VERSION"; exit 0 ;;
     *) setup_colors; die "unknown option: $1 (try --help)" ;;
   esac
@@ -385,12 +385,16 @@ BRANCH_W=$(( $(term_cols) - 40 ))
 [ "$BRANCH_W" -gt 60 ] && BRANCH_W=60
 [ "$BRANCH_W" -lt 24 ] && BRANCH_W=24
 
+# Per-repo tallies up front, so the render loop never re-reads $FOUND.
+COUNTS="$(awk -F'\t' '{c[$1]++} END{for (k in c) printf "%s\t%d\n", k, c[k]}' "$FOUND")"
+repos_hit="$(printf '%s\n' "$COUNTS" | grep -c .)"
+
 rule
 current_repo=""
 while IFS=$'\t' read -r name path br date age sha merged; do
   if [ "$name" != "$current_repo" ]; then
     current_repo="$name"
-    n="$(awk -F'\t' -v r="$name" '$1==r' "$FOUND" | wc -l | tr -d ' ')"
+    n="$(printf '%s\n' "$COUNTS" | awk -F'\t' -v r="$name" '$1==r{print $2; exit}')"
     printf '\n%s%s%s %s%s %s%s\n' \
       "$BOLD$CYAN" "$name" "$RESET" "$DIM" "$path" "$BULLET $n" "$RESET"
   fi
@@ -403,7 +407,6 @@ done < "$FOUND"
 
 echo
 rule
-repos_hit="$(cut -f1 "$FOUND" | sort -u | wc -l | tr -d ' ')"
 printf '%s%d %s%s across %s%d %s%s %s%s%d examined %s %ds%s\n' \
   "$BOLD" "$total" "$(plural "$total" branch)" "$RESET" \
   "$BOLD" "$repos_hit" "$(plural "$repos_hit" repo)" "$RESET" \
