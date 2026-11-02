@@ -9,7 +9,7 @@ machine — and deletes them only if you say so, one by one, per repo, or all at
 ```
 $ git-sweep-branches --list
 
-› git-sweep-branches v1.2.0
+› git-sweep-branches v1.3.0
   14 repos • merged • idle > 30 days
 
    1/14 api                       ✓ 19 of 87 remote branches
@@ -96,11 +96,19 @@ Signal 3 is capped at 200 commits ahead so a runaway branch can't stall the scan
 - The repo's default branch.
 - Branches with an **open PR**.
 - Branches **checked out** in the repo or any linked worktree.
-- Names matching the protected pattern: `main`, `master`, `develop`, `staging`,
-  `production`, `release-candidate`, anything containing `sprint`, and anything under
-  `backup/`, `archive/`, `prod/`, `demo*`, `release-please*`, `dependabot/`,
-  `revert-*`. Override with `--include-protected`, or replace the pattern with
-  `--protect REGEX`.
+- Names matching the protected pattern: `main`, `master`, `develop`, `dev`,
+  `staging`, `production`, `release`, `release/*`, `release-candidate*` (also with a
+  `pre-` or `test-` prefix), `preview*`, `test/deploy`, `demo*`, `release-please*`,
+  `dependabot/`, `revert-*`, and sprint branches — names that **start** with `sprint`
+  (`sprint-27`, `sprint-15-merged`, `origin/sprint-26`). Work branches that only
+  mention a sprint, like `feat/sprint-27-export` or `fix/audit-fixes-sprint-27`,
+  sweep like any other. Override with `--include-protected`, or replace the pattern
+  with `--protect REGEX`.
+- **Snapshots** — `archive*/`, `backup*/`, `prod/`, `copy/`, `*-copy` —
+  while they hold a commit that is not on `main`, the default branch, or any
+  `sprint-N`. Once every commit is there (by ancestry or patch-id) the snapshot is
+  dead weight and is listed like any merged branch. A merged PR alone does not
+  count for a snapshot. `--include-protected` treats snapshots as ordinary branches.
 - **Local** branches — untouched unless you pass `--prune-local`.
 
 ## Undo
