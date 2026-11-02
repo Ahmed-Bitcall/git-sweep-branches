@@ -17,7 +17,7 @@
 
 set -uo pipefail
 
-VERSION="1.2.0"
+VERSION="1.3.0"
 AGE_DAYS=30
 LIST_ONLY=0
 JSON=0
@@ -33,9 +33,15 @@ AUTHORS=()
 REPOS=()
 EXTRA_INTO=()
 
-# Shared/integration refs that are merged-and-old by nature — deleting them
-# throws away the only pointer to a snapshot someone may still need.
-PROTECT_RE='^(main|master|develop|dev|staging|production|release-candidate|preview|release|HEAD)$|sprint|^backup/|^archive/|^prod/|^demo|^release-please|^dependabot/|^revert-'
+# Shared/integration refs that are merged-and-old by nature — never swept.
+# Sprint branches are the ones named for the sprint (sprint-27, sprint-15-merged);
+# feat/sprint-27-thing is ordinary work and sweeps like any other branch.
+PROTECT_RE='^(main|master|develop|dev|staging|production|release|HEAD)$|^(origin/)?sprint|^(pre-|test-)?release-candidate|^preview|^release/|^test[/-]deploy$|^demo|^release-please|^dependabot/|^revert-'
+
+# Snapshots (archive/, backup/, copies) are kept while they hold the only copy
+# of some commit, and swept once every commit is on main, the default branch or
+# a sprint-N. A merged PR alone does not count: snapshots get re-pushed after it.
+SNAPSHOT_RE='^(archive|backup)[^/]*/|^(prod|copy)/|-copy$'
 
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/git-sweep-branches"
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/git-sweep-branches"
@@ -95,6 +101,13 @@ merged_color() {
     squash*)     printf '%s' "$MAGENTA" ;;
     *)           printf '%s' "$BLUE" ;;
   esac
+}
+
+squashed_into() { # <into-ref> <ref> — every commit already upstream by patch-id
+  # git cherry compares by patch-id; cap the work on runaway branches.
+  ahead="$(git rev-list --count "$1..$2" 2>/dev/null)"
+  [ -n "$ahead" ] && [ "$ahead" -le 200 ] &&
+    [ "$(git cherry "$1" "$2" 2>/dev/null | grep -c '^+')" -eq 0 ]
 }
 
 truncate_to() { # <string> <width>
@@ -266,6 +279,14 @@ for repo in "${REPOS[@]}"; do
     done
   fi
 
+  # Where a snapshot's commits may already live: the merge targets, main, and
+  # every sprint-N.
+  mainline_refs=("${into_refs[@]}")
+  while IFS= read -r m; do
+    mainline_refs[${#mainline_refs[@]}]="$m"
+  done < <(git for-each-ref --format='%(refname)' refs/remotes/origin/main 'refs/remotes/origin/sprint-*' |
+           grep -E '/(main|sprint-[0-9]+)$')
+
   open_prs="$(gh pr list --state open --limit 500 --json headRefName -q '.[].headRefName' 2>/dev/null)"
   merged_prs="$(gh pr list --state merged --limit 500 --json number,headRefName,mergedAt \
     -q '.[] | .headRefName + "\t#" + (.number|tostring) + " " + (.mergedAt|split("T")[0])' 2>/dev/null)"
@@ -311,22 +332,32 @@ for repo in "${REPOS[@]}"; do
     # Merged: contained in an integration branch, or a merged PR, or every
     # commit already upstream by patch-id (how squash merges look).
     merged=""
-    for into in "${into_refs[@]}"; do
-      if git merge-base --is-ancestor "$ref" "$into" 2>/dev/null; then
-        merged="in ${into#refs/remotes/origin/}"; break
+    if [ "$INCLUDE_PROTECTED" -eq 0 ] && [[ "$br" =~ $SNAPSHOT_RE ]]; then
+      for into in "${mainline_refs[@]}"; do
+        if git merge-base --is-ancestor "$ref" "$into" 2>/dev/null; then
+          merged="in ${into#refs/remotes/origin/}"; break
+        fi
+        if squashed_into "$into" "$ref"; then
+          merged="squashed into ${into#refs/remotes/origin/}"; break
+        fi
+      done
+      if [ -z "$merged" ]; then
+        sk_protected=$((sk_protected + 1)); trace "$name/$br — snapshot with commits on no mainline"; continue
       fi
-    done
+    fi
+    if [ -z "$merged" ]; then
+      for into in "${into_refs[@]}"; do
+        if git merge-base --is-ancestor "$ref" "$into" 2>/dev/null; then
+          merged="in ${into#refs/remotes/origin/}"; break
+        fi
+      done
+    fi
     if [ -z "$merged" ]; then
       pr="$(printf '%s\n' "$merged_prs" | awk -F'\t' -v b="$br" '$1==b{print $2; exit}')"
       if [ -n "$pr" ]; then
         merged="PR $pr"
-      else
-        # git cherry compares by patch-id; cap the work on runaway branches.
-        ahead="$(git rev-list --count "refs/remotes/origin/$default..$ref" 2>/dev/null)"
-        if [ -n "$ahead" ] && [ "$ahead" -le 200 ] &&
-           [ "$(git cherry "refs/remotes/origin/$default" "$ref" 2>/dev/null | grep -c '^+')" -eq 0 ]; then
-          merged="squashed into $default"
-        fi
+      elif squashed_into "refs/remotes/origin/$default" "$ref"; then
+        merged="squashed into $default"
       fi
     fi
     if [ -z "$merged" ]; then
