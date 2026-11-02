@@ -46,6 +46,13 @@ macOS bash is fine.
 Prefer to read before you run? Clone it and run `./install.sh`, or just copy
 `bin/git-sweep-branches` anywhere on your `PATH`.
 
+### Updates
+
+On an interactive run it checks `main` for a newer version and asks
+`Install it now? [y/n]`. Answer `y` and it replaces itself, then re-runs with the same
+arguments. It never asks when piped, with `--json`, or when offline, and it won't
+overwrite a symlinked or git-checkout copy — `git pull` those instead.
+
 ## Use
 
 ```sh
